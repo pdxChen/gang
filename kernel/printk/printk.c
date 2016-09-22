@@ -369,6 +369,33 @@ __packed __aligned(4)
 #endif
 ;
 
+#ifdef CONFIG_EARLY_PRINTK
+struct console *early_console;
+
+static int early_vprintk(const char *fmt, va_list args)
+{
+	char buf[512];
+	int n;
+
+	n = vscnprintf(buf, sizeof(buf), fmt, args);
+	early_console->write(early_console, buf, n);
+
+	return n;
+}
+
+asmlinkage __visible void early_printk(const char *fmt, ...)
+{
+	va_list ap;
+
+	if (!early_console)
+		return;
+
+	va_start(ap, fmt);
+	early_vprintk(fmt, ap);
+	va_end(ap);
+}
+#endif
+
 /*
  * The logbuf_lock protects kmsg buffer, indices, counters.  This can be taken
  * within the scheduler's rq lock. It must be released before calling
@@ -2010,26 +2037,6 @@ static size_t msg_print_text(const struct printk_log *msg,
 static bool suppress_message_printing(int level) { return false; }
 
 #endif /* CONFIG_PRINTK */
-
-#ifdef CONFIG_EARLY_PRINTK
-struct console *early_console;
-
-asmlinkage __visible void early_printk(const char *fmt, ...)
-{
-	va_list ap;
-	char buf[512];
-	int n;
-
-	if (!early_console)
-		return;
-
-	va_start(ap, fmt);
-	n = vscnprintf(buf, sizeof(buf), fmt, ap);
-	va_end(ap);
-
-	early_console->write(early_console, buf, n);
-}
-#endif
 
 static int __add_preferred_console(char *name, int idx, char *options,
 				   char *brl_options)
