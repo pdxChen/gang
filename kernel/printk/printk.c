@@ -381,13 +381,46 @@ static int __init force_early_printk_setup(char *str)
 }
 early_param("force_early_printk", force_early_printk_setup);
 
+static int early_printk_cpu = -1;
+
 static int early_vprintk(const char *fmt, va_list args)
 {
+	int n, cpu, old;
 	char buf[512];
-	int n;
+
+	cpu = get_cpu();
+	/*
+	 * Test-and-Set inter-cpu spinlock with recursion.
+	 */
+	for (;;) {
+		/*
+		 * c-cas to avoid the exclusive bouncing on spin.
+		 * Depends on the memory barrier implied by cmpxchg
+		 * for ACQUIRE semantics.
+		 */
+		old = READ_ONCE(early_printk_cpu);
+		if (old == -1) {
+			old = cmpxchg(&early_printk_cpu, -1, cpu);
+			if (old == -1)
+				break;
+		}
+		/*
+		 * Allow recursion for interrupts and the like.
+		 */
+		if (old == cpu)
+			break;
+
+		cpu_relax();
+	}
 
 	n = vscnprintf(buf, sizeof(buf), fmt, args);
 	early_console->write(early_console, buf, n);
+
+	/*
+	 * Unlock -- in case @old == @cpu, this is a no-op.
+	 */
+	smp_store_release(&early_printk_cpu, old);
+	put_cpu();
 
 	return n;
 }
