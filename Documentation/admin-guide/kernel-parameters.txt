@@ -1189,6 +1189,11 @@
 			parameter will force ia64_sal_cache_flush to call
 			ia64_pal_cache_flush instead of SAL_CACHE_FLUSH.
 
+	force_early_printk
+			Forcefully uses early_console (as per earlyprintk=)
+			usage for regular printk, bypassing everything,
+			including the syslog (dmesg will be empty).
+
 	forcepae	[X86-32]
 			Forcefully enable Physical Address Extension (PAE).
 			Many Pentium M systems disable PAE but may have a
