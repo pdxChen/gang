@@ -1743,11 +1743,23 @@ static int ttwu_remote(struct task_struct *p, int wake_flags)
 }
 
 #ifdef CONFIG_SMP
+static void sched_wake_special(struct rq *rq)
+{
+	/*
+	 * Check if someone kicked us for doing the nohz idle load balance.
+	 */
+	if (unlikely(got_nohz_idle_kick())) {
+		rq->idle_balance = 1;
+		raise_softirq_irqoff(SCHED_SOFTIRQ);
+	}
+}
+
 void sched_ttwu_pending(void)
 {
 	struct rq *rq = this_rq();
 	struct llist_node *llist = llist_del_all(&rq->wake_list);
 	struct task_struct *p, *t;
+	bool special = false;
 	struct rq_flags rf;
 
 	if (!llist)
@@ -1756,9 +1768,18 @@ void sched_ttwu_pending(void)
 	rq_lock_irqsave(rq, &rf);
 	update_rq_clock(rq);
 
-	llist_for_each_entry_safe(p, t, llist, wake_entry)
-		ttwu_do_activate(rq, p, p->sched_remote_wakeup ? WF_MIGRATED : 0, &rf);
+	llist_for_each_entry_safe(p, t, llist, wake_entry) {
+		if (unlikely(p == rq->idle)) {
+			WRITE_ONCE(p->wake_entry.next, &p->wake_entry);
+			smp_mb();
+			special = true;
+			continue;
+		}
 
+		ttwu_do_activate(rq, p, p->sched_remote_wakeup ? WF_MIGRATED : 0, &rf);
+	}
+	if (special)
+		sched_wake_special(rq);
 	rq_unlock_irqrestore(rq, &rf);
 }
 
@@ -1771,7 +1792,7 @@ void scheduler_ipi(void)
 	 */
 	preempt_fold_need_resched();
 
-	if (llist_empty(&this_rq()->wake_list) && !got_nohz_idle_kick())
+	if (llist_empty(&this_rq()->wake_list))
 		return;
 
 	/*
@@ -1789,14 +1810,6 @@ void scheduler_ipi(void)
 	 */
 	irq_enter();
 	sched_ttwu_pending();
-
-	/*
-	 * Check if someone kicked us for doing the nohz idle load balance.
-	 */
-	if (unlikely(got_nohz_idle_kick())) {
-		this_rq()->idle_balance = 1;
-		raise_softirq_irqoff(SCHED_SOFTIRQ);
-	}
 	irq_exit();
 }
 
@@ -1806,12 +1819,22 @@ static void ttwu_queue_remote(struct task_struct *p, int cpu, int wake_flags)
 
 	p->sched_remote_wakeup = !!(wake_flags & WF_MIGRATED);
 
-	if (llist_add(&p->wake_entry, &cpu_rq(cpu)->wake_list)) {
+	if (llist_add(&p->wake_entry, &rq->wake_list)) {
 		if (!set_nr_if_polling(rq->idle))
 			smp_send_reschedule(cpu);
 		else
 			trace_sched_wake_idle_without_ipi(cpu);
 	}
+}
+
+void smp_reschedule_special(int cpu)
+{
+	struct rq *rq = cpu_rq(cpu);
+	struct task_struct *p = rq->idle;
+	struct llist_node *old = &p->wake_entry;
+
+	if (try_cmpxchg(&p->wake_entry.next, &old, NULL))
+		ttwu_queue_remote(p, cpu, 0);
 }
 
 void wake_up_if_idle(int cpu)
@@ -5436,6 +5459,7 @@ void init_idle(struct task_struct *idle, int cpu)
 	idle->on_rq = TASK_ON_RQ_QUEUED;
 #ifdef CONFIG_SMP
 	idle->on_cpu = 1;
+	idle->wake_entry.next = &idle->wake_entry;
 #endif
 	raw_spin_unlock(&rq->lock);
 	raw_spin_unlock_irqrestore(&idle->pi_lock, flags);

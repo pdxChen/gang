@@ -1102,6 +1102,7 @@ queue_balance_callback(struct rq *rq,
 }
 
 extern void sched_ttwu_pending(void);
+extern void smp_reschedule_special(int cpu);
 
 #define rcu_dereference_check_sched_domain(p) \
 	rcu_dereference_check((p), \
