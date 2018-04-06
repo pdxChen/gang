@@ -114,6 +114,7 @@ cpumask_var_t __read_mostly	tracing_buffer_mask;
  * /proc/sys/kernel/ftrace_dump_on_oops
  * Set 1 if you want to dump buffers of all CPUs
  * Set 2 if you want to dump the buffer of the CPU that triggered oops
+ * Set 3 if you want to dump the buffers of the Core that triggered the oops
  */
 
 enum ftrace_dump_mode ftrace_dump_on_oops;
@@ -186,6 +187,11 @@ static int __init set_ftrace_dump_on_oops(char *str)
 		ftrace_dump_on_oops = DUMP_ORIG;
                 return 1;
         }
+
+	if (!strcmp("orig_core", str)) {
+		ftrace_dump_on_oops = DUMP_CORE;
+		return 1;
+	}
 
         return 0;
 }
@@ -8307,6 +8313,10 @@ void ftrace_dump(enum ftrace_dump_mode oops_dump_mode)
 		break;
 	case DUMP_ORIG:
 		iter.cpu_file = raw_smp_processor_id();
+		break;
+	case DUMP_CORE:
+		iter.cpu_file = RING_BUFFER_ALL_CPUS;
+		cpumask_copy(tracing_buffer_mask, cpu_smt_mask(raw_smp_processor_id()));
 		break;
 	case DUMP_NONE:
 		goto out_enable;
