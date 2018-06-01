@@ -1775,6 +1775,8 @@ extern long sched_getaffinity(pid_t pid, struct cpumask *mask);
 #define TASK_SIZE_OF(tsk)	TASK_SIZE
 #endif
 
+extern void sched_ttwu_pending(void);
+
 #ifdef CONFIG_RSEQ
 
 /*

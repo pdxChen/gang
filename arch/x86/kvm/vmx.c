@@ -10005,6 +10005,18 @@ static void vmx_handle_external_intr(struct kvm_vcpu *vcpu)
 #endif
 
 		vector =  exit_intr_info & INTR_INFO_VECTOR_MASK;
+
+		/*
+		 * Fast path for vcpu synchronization
+		 * without going through the full handler
+		 */
+		if (vector == RESCHEDULE_VECTOR) {
+			inc_irq_stat(irq_resched_count);
+			ack_APIC_irq();
+			preempt_fold_need_resched();
+			sched_ttwu_pending();
+			return;
+		}
 		desc = (gate_desc *)vmx->host_idt_base + vector;
 		entry = gate_offset(desc);
 		asm volatile(
