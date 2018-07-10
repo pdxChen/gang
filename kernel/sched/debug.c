@@ -173,6 +173,24 @@ static const struct file_operations sched_feat_fops = {
 
 __read_mostly bool sched_debug_enabled;
 
+static int sched_vcpu_show(struct seq_file *m, void *v)
+{
+	seq_printf(m, "%d\n", vcpu_sched_enabled());
+	return 0;
+}
+
+static int sched_vcpu_open(struct inode *inode, struct file *filp)
+{
+	return single_open(filp, sched_vcpu_show, NULL);
+}
+
+static const struct file_operations sched_vcpu_fops = {
+	.open = sched_vcpu_open,
+	.read = seq_read,
+	.llseek = seq_lseek,
+	.release = single_release,
+};
+
 static __init int sched_init_debug(void)
 {
 	debugfs_create_file("sched_features", 0644, NULL, NULL,
@@ -180,6 +198,8 @@ static __init int sched_init_debug(void)
 
 	debugfs_create_bool("sched_debug", 0644, NULL,
 			&sched_debug_enabled);
+
+	debugfs_create_file("sched_vcpu", 0444, NULL, NULL, &sched_vcpu_fops);
 
 	return 0;
 }

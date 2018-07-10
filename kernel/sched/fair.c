@@ -5476,6 +5476,27 @@ static inline bool vcpu_wrong_class(struct task_struct *p)
 	return false;
 }
 
+static __always_inline
+void vcpu_debug(struct sched_domain_shared *sds, struct rq *rq, const char *msg)
+{
+	if (!sched_feat(VCPU_TRACE))
+		return;
+
+	trace_printk("%s cookie: %lx users: %d seq: %d ipi: %d pause: %d rq->seq: %d rq->ipi: %d rq->pause: %d\n",
+			msg,
+			sds->rendezvous_cookie,
+			sds->rendezvous_users,
+			sds->rendezvous_seq,
+			sds->rendezvous_ipi,
+			sds->rendezvous_pause,
+			rq->rendezvous_seq,
+			rq->rendezvous_ipi,
+			rq->rendezvous_pause);
+}
+
+#define vcpu_printk(fmt...) \
+	if (sched_feat(VCPU_TRACE)) trace_printk(fmt)
+
 /*
  * This SMT co-scheduling stuff ensures that VCPU guest mode never runs
  * concurrently with other guest or user tasks. It does however explicitly
@@ -5571,6 +5592,7 @@ __vcpu_ipi_others(struct sched_domain_shared *sds, int this_cpu, bool skip_idle)
 			continue;
 		}
 
+		vcpu_printk("IPI(%d)\n", cpu);
 		smp_reschedule_special(cpu);
 
 		wait = true;
@@ -5614,6 +5636,7 @@ vcpu_pick_next_task(struct rq *rq, struct task_struct *prev)
 		 */
 		if (wakeup_preempt_entity(&p->se, left) == 1) {
 			set_curr_task(rq, prev);
+			vcpu_printk("pick fairness\n");
 			p = NULL;
 			goto unlock;
 		}
@@ -5631,6 +5654,8 @@ vcpu_pick_next_task(struct rq *rq, struct task_struct *prev)
 	} else {
 		p = idle_sched_class.pick_next_task(rq, prev, NULL);
 	}
+
+	vcpu_printk("picked: %d/%s\n", p->pid, p->comm);
 
 unlock:
 	raw_spin_unlock(&sds->rendezvous_lock);
@@ -5685,6 +5710,7 @@ void vcpu_ipi(void)
 	if (rq->rendezvous_ipi == sds->rendezvous_ipi)
 		goto unlock;
 
+	vcpu_debug(sds, rq, "ipi");
 	WRITE_ONCE(rq->rendezvous_ipi, sds->rendezvous_ipi);
 
 	if (rendezvous_state(sds) & RENDEZVOUS_STATE_IN) {
@@ -5713,6 +5739,8 @@ void vcpu_ipi(void)
 
 unlock:
 	raw_spin_unlock(&sds->rendezvous_lock);
+
+	vcpu_printk("ipi-exit\n");
 }
 
 static inline bool __vcpu_stale_rendezvous(struct rq *rq, struct sched_domain_shared *sds)
@@ -5734,6 +5762,7 @@ bool vcpu_put_prev(struct rq *rq, struct task_struct *p)
 		return true;
 
 	raw_spin_lock(&sds->rendezvous_lock);
+	vcpu_debug(sds, rq, "put_prev-enter");
 
 	if (rq->rendezvous_pause) {
 		WARN_ON_ONCE(!(rendezvous_state(sds) & RENDEZVOUS_STATE_PAUSE));
@@ -5770,6 +5799,7 @@ bool vcpu_put_prev(struct rq *rq, struct task_struct *p)
 	last = true;
 
 unlock:
+	vcpu_debug(sds, rq, "put_prev-exit");
 	raw_spin_unlock(&sds->rendezvous_lock);
 
 	return last;
@@ -5882,6 +5912,7 @@ void vcpu_set_next(struct rq *rq, struct task_struct *p)
 
 again:
 	raw_spin_lock_irq(&sds->rendezvous_lock);
+	vcpu_debug(sds, rq, "set_next-enter");
 
 	if (__vcpu_stale_rendezvous(rq, sds)) {
 		unsigned int ipi = sds->rendezvous_ipi;
@@ -5959,6 +5990,7 @@ rendezvous:
 	}
 
 unlock:
+	vcpu_debug(sds, rq, "set_next-exit");
 	raw_spin_unlock_irq(&sds->rendezvous_lock);
 
 	if (!success) {
@@ -5972,6 +6004,8 @@ unlock:
 
 		set_tsk_need_resched(rq->curr);
 		set_preempt_need_resched();
+
+		vcpu_printk("set_next FAIL!!\n");
 	}
 }
 
@@ -5985,6 +6019,7 @@ static bool vcpu_unpause(struct rq *rq, bool irq)
 		return success;
 
 	raw_spin_lock_irqsave(&sds->rendezvous_lock, flags);
+	vcpu_debug(sds, rq, "rendezvous-unpause-in");
 
 	/* got cancelled */
 	if (!rendezvous_cookie(sds))
@@ -6026,6 +6061,7 @@ unlock_success:
 	success = true;
 
 unlock:
+	vcpu_debug(sds, rq, "rendezvous-unpause-out");
 	raw_spin_unlock_irqrestore(&sds->rendezvous_lock, flags);
 	return success;
 }
@@ -6040,6 +6076,7 @@ static bool vcpu_pause_others(struct rq *rq, bool irq)
 		return success;
 
 	raw_spin_lock(&sds->rendezvous_lock);
+	vcpu_debug(sds, this_rq(), "rendezvous-pause-in");
 	if (!rendezvous_cookie(sds)) /* someone cancelled already */
 		goto unlock;
 
@@ -6074,6 +6111,7 @@ unlock_success:
 	success = true;
 
 unlock:
+	vcpu_debug(sds, this_rq(), "rendezvous-pause-out");
 	raw_spin_unlock(&sds->rendezvous_lock);
 
 	return success;
@@ -6095,6 +6133,8 @@ void vcpu_register(unsigned long virt_cookie)
 {
 	struct rq *rq = this_rq();
 
+	vcpu_printk("vcpu: %d/%s cookie:%lx\n", current->pid, current->comm, virt_cookie);
+
 	raw_spin_lock_irq(&rq->lock);
 	current->virt_cookie = virt_cookie;
 	if (current->sched_class == &fair_sched_class)
@@ -6112,6 +6152,8 @@ void vcpu_unregister(unsigned long virt_cookie)
 {
 	struct rq *rq = this_rq();
 	bool resched = false;
+
+	vcpu_printk("vcpu: %d/%s cookie:%lx\n", current->pid, current->comm, current->virt_cookie);
 
 	local_irq_disable();
 
