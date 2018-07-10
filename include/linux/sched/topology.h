@@ -75,6 +75,10 @@ struct sched_domain_shared {
 
 #ifdef CONFIG_SCHED_VCPU
 	raw_spinlock_t	rendezvous_lock;
+	unsigned long	rendezvous_cookie;
+	unsigned int	rendezvous_users;
+	unsigned int	rendezvous_seq;
+	unsigned int	rendezvous_ipi;
 #endif
 };
 

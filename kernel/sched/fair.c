@@ -5463,6 +5463,497 @@ static struct task_struct *vcpu_find(struct rq *rq, unsigned long virt_cookie)
 	return match;
 }
 
+/* wrong: stop,dl,rt good: fair,idle */
+static inline bool vcpu_wrong_class(struct task_struct *p)
+{
+	const struct sched_class *class = p->sched_class;
+
+	while ((class = class->next)) {
+		if (class == &fair_sched_class)
+			return true;
+	}
+
+	return false;
+}
+
+/*
+ * This SMT co-scheduling stuff ensures that VCPU guest mode never runs
+ * concurrently with other guest or user tasks. It does however explicitly
+ * allow some overlap with kernel scheduler and kvm execution, thereby possibly
+ * exposing that state to guests. Exposing this state is assumed 'safe' -- it
+ * holds no 'secrets'.
+ *
+ * For scheduling OUT we rely on the assumption that _sending_ IPIs to siblings
+ * will 'instantly' kick them out of guest mode. We do not need to wait/sync up
+ * with IPI delivery (this greatly simplifies things). Coupled with the IPI
+ * actually forcing a reschedule this ensure the guest will not run again
+ * without being vetted by vcpu_pick_next_task() to be compatible.
+ *
+ * For scheduling IN we sync against the sibling reaching schedule()
+ * (vcpu_put_prev() to be specific). This guarantees this VCPU task cannot
+ * enter guest mode until all siblings have stopped running incompatible tasks.
+ *
+ * If task selection for whatever reason ends up picking an incompatible task,
+ * it will cancel the vcpu state (see OUT).
+ *
+ *
+ * LOCKING:
+ *
+ * sds::rendezvous_lock   serializes all sds::rendezvous_* and rq::rendezvous_*
+ * sds::rendezvous_cookie read unlocked
+ * sds::rendezvous_users
+ * sds::rendezvous_seq    read unlocked
+ * sds::rendezvous_ipi    read unlocked
+ *
+ * rq::vcpu_tree          rq->lock + sds->rendezvous_lock
+ * rq::rendezvous_seq	  read unlocked
+ * rq::rendezvous_ipi	  read unlocked
+ *
+ * p::vcpu_node		  rq->lock + sds->rendezvous_lock
+ * p::virt_cookie
+ * p::virt_enqueued
+ *
+ */
+
+#define RENDEZVOUS_STATE_IN	(1UL)
+#define RENDEZVOUS_STATE_PAUSE	(2UL)
+
+#define RENDEZVOUS_STATE_MASK	(3UL)
+
+static inline unsigned long rendezvous_cookie(struct sched_domain_shared *sds)
+{
+	return sds->rendezvous_cookie & ~RENDEZVOUS_STATE_MASK;
+}
+
+static inline unsigned int rendezvous_state(struct sched_domain_shared *sds)
+{
+	return sds->rendezvous_cookie & RENDEZVOUS_STATE_MASK;
+}
+
+static inline unsigned long virt_cookie(struct task_struct *p)
+{
+	if (p->virt_enqueued)
+		return p->virt_cookie;
+
+	return 0UL;
+}
+
+static bool
+__vcpu_ipi_others(struct sched_domain_shared *sds, int this_cpu, bool skip_idle)
+{
+	unsigned int cpu;
+	bool wait = false;
+
+	lockdep_assert_held(&sds->rendezvous_lock);
+
+	WRITE_ONCE(sds->rendezvous_ipi, sds->rendezvous_ipi + 1);
+
+	for_each_cpu(cpu, cpu_smt_mask(this_cpu)) {
+		struct rq *rq = cpu_rq(cpu);
+
+		/*
+		 * @skip_idle -- used by __vcpu_rendezvous_in() and
+		 * vcpu_pause_others().
+		 *
+		 * Because of rendezvous_lock we must either send the IPI or
+		 * vcpu_set_next() will observe our state.
+		 */
+		if (cpu == this_cpu || (skip_idle && rq->curr == rq->idle)) {
+			WRITE_ONCE(rq->rendezvous_seq, sds->rendezvous_seq);
+			continue;
+		}
+
+		smp_reschedule_special(cpu);
+
+		wait = true;
+	}
+
+	return wait;
+}
+
+static struct task_struct *
+vcpu_pick_next_task(struct rq *rq, struct task_struct *prev)
+{
+	struct sched_domain_shared *sds = per_cpu(sd_smt_shared, cpu_of(rq));
+	struct task_struct *p = NULL;
+	unsigned long cookie;
+
+	if (!sds)
+		return NULL;
+
+	raw_spin_lock(&sds->rendezvous_lock);
+	cookie = rendezvous_cookie(sds);
+	if (!cookie)
+		goto unlock;
+
+	p = vcpu_find(rq, sds->rendezvous_cookie);
+	if (p)
+		put_prev_task(rq, prev);
+
+	if (p && rq->cfs.h_nr_running > 1) {
+		struct cfs_rq *cfs_rq = &rq->cfs;
+		struct sched_entity *left;
+
+		do {
+			left = __pick_first_entity(cfs_rq);
+			cfs_rq = group_cfs_rq(left);
+		} while (cfs_rq);
+
+		/*
+		 * Ensure some fairness such that we don't starve !VCPU tasks.
+		 * This will most likely result in vcpu_set_next() doing a
+		 * cancel.
+		 */
+		if (wakeup_preempt_entity(&p->se, left) == 1) {
+			set_curr_task(rq, prev);
+			p = NULL;
+			goto unlock;
+		}
+	}
+
+	if (p) {
+		struct sched_entity *se;
+
+		se = &p->se;
+		for_each_sched_entity(se) {
+			struct cfs_rq *cfs_rq = cfs_rq_of(se);
+
+			set_next_entity(cfs_rq, se);
+		}
+	} else {
+		p = idle_sched_class.pick_next_task(rq, prev, NULL);
+	}
+
+unlock:
+	raw_spin_unlock(&sds->rendezvous_lock);
+
+	return p;
+}
+
+static void __vcpu_cancel(struct sched_domain_shared *sds, int this_cpu, bool resched)
+{
+	int cpu;
+
+	lockdep_assert_held(&sds->rendezvous_lock);
+
+	if (sds->rendezvous_cookie == 0)
+		resched = false;
+
+	WRITE_ONCE(sds->rendezvous_cookie, 0UL);
+	sds->rendezvous_users = 0;
+
+	/*
+	 * By sending IPIs after clearing we guarantee those CPUs will
+	 * no longer be running whatever task they were.
+	 *
+	 * Can be elided when we know the other siblings are spinning.
+	 */
+	if (resched)
+		__vcpu_ipi_others(sds, smp_processor_id(), false);
+}
+
+/*
+ * called from scheduler_ipi()
+ */
+void vcpu_ipi(void)
+{
+	struct sched_domain_shared *sds = this_cpu_read(sd_smt_shared);
+	struct task_struct *p = current;
+	struct rq *rq = this_rq();
+
+	lockdep_assert_held(&rq->lock);
+
+	if (WARN_ON_ONCE(!sds))
+		return;
+
+	raw_spin_lock(&sds->rendezvous_lock);
+	if (rq->rendezvous_ipi == sds->rendezvous_ipi)
+		goto unlock;
+
+	WRITE_ONCE(rq->rendezvous_ipi, sds->rendezvous_ipi);
+
+	if (rendezvous_state(sds) & RENDEZVOUS_STATE_IN) {
+		if (vcpu_wrong_class(current)) {
+			__vcpu_cancel(sds, cpu_of(rq), false /* SMT2 only */);
+			goto unlock;
+		}
+
+		if (p->sched_class == &fair_sched_class) {
+			s64 delta_exec = p->se.sum_exec_runtime - p->se.prev_sum_exec_runtime;
+
+			if (delta_exec < sysctl_sched_min_granularity) {
+				__vcpu_cancel(sds, cpu_of(rq), false /* SMT2 only */);
+				goto unlock;
+			}
+		}
+	}
+
+	/*
+	 * Since we're now in the interrupt handler, and we'll
+	 * reschedule on return from interrupt, this CPU no longer
+	 * runs this task.
+	 */
+	set_tsk_need_resched(rq->curr);
+	set_preempt_need_resched();
+
+unlock:
+	raw_spin_unlock(&sds->rendezvous_lock);
+}
+
+static inline bool __vcpu_stale_rendezvous(struct rq *rq, struct sched_domain_shared *sds)
+{
+	return (rendezvous_state(sds) & RENDEZVOUS_STATE_IN) &&
+	       (rq->rendezvous_seq != sds->rendezvous_seq);
+}
+
+/*
+ * called from schedule() on @prev, before task selection, IRQs disabled,
+ * rq->lock not held.
+ */
+bool vcpu_put_prev(struct rq *rq, struct task_struct *p)
+{
+	struct sched_domain_shared *sds = this_cpu_read(sd_smt_shared);
+	bool last = false;
+
+	if (!sds)
+		return true;
+
+	raw_spin_lock(&sds->rendezvous_lock);
+
+	/*
+	 * Now that we hit schedule() we no longer run the previous task; let
+	 * the rendezvous proceed. In this case the users count is 'new' so
+	 * don't decrement.
+	 */
+	if (__vcpu_stale_rendezvous(rq, sds)) {
+		WRITE_ONCE(rq->rendezvous_seq, sds->rendezvous_seq);
+		goto unlock;
+	}
+
+	/* No active filter, nobody cares */
+	if (!rendezvous_cookie(sds))
+		goto unlock;
+
+	/*
+	 * There is a filter, but the outgoing task doesn't match;
+	 * this can happen because the other CPU just put a filter
+	 * in place and we're rescheduling to match.
+	 */
+	if (rendezvous_cookie(sds) != virt_cookie(p))
+		goto unlock;
+
+	if (--sds->rendezvous_users != 0)
+		goto unlock;
+
+	__vcpu_cancel(sds, cpu_of(rq), true);
+	last = true;
+
+unlock:
+	raw_spin_unlock(&sds->rendezvous_lock);
+
+	return last;
+}
+
+static void yield_task_fair(struct rq *rq);
+
+static bool
+__vcpu_rendezvous_in(struct sched_domain_shared *sds, int this_cpu, struct task_struct *p)
+{
+	unsigned long cookie = virt_cookie(p);
+	unsigned int seq;
+	int cpu;
+
+	WARN_ON_ONCE(sds->rendezvous_cookie);
+
+	WRITE_ONCE(sds->rendezvous_cookie, cookie | RENDEZVOUS_STATE_IN);
+	sds->rendezvous_users = 1;
+
+	seq = sds->rendezvous_seq + 1;
+	WRITE_ONCE(sds->rendezvous_seq, seq);
+
+	/*
+	 * If a CPU was already IDLE, restricting the tasks we can run will
+	 * not make it run anything.
+	 */
+	if (!__vcpu_ipi_others(sds, this_cpu, true))
+		goto done;
+
+	raw_spin_unlock_irq(&sds->rendezvous_lock);
+
+	/*
+	 * Wait for all siblings to hit schedule(); just waiting for IPI
+	 * completion does not guarantee they immediately stop running
+	 * whatever task they ran; preempt_disable() etc..
+	 */
+	for_each_cpu(cpu, cpu_smt_mask(this_cpu)) {
+		struct rq *rq = cpu_rq(cpu);
+
+		if (cpu == this_cpu)
+			continue;
+
+		for (;;) {
+			if ((int)(READ_ONCE(rq->rendezvous_seq) - seq) >= 0)
+				break;
+
+			if (!READ_ONCE(sds->rendezvous_cookie)) /* cancelled */
+				break;
+
+			if (need_resched())
+				break;
+
+			cpu_relax();
+		}
+	}
+
+	raw_spin_lock_irq(&sds->rendezvous_lock);
+
+	if (rendezvous_cookie(sds) != virt_cookie(p))
+		return false;
+
+	/*
+	 * If we need to reschedule, and the sibling hadn't joined yet
+	 * cancel the rendezvous such that we can pick next without
+	 * constraint.
+	 */
+	if (need_resched() && sds->rendezvous_users == 1) {
+		__vcpu_cancel(sds, this_cpu, true);
+		return true; // don't yield
+	}
+
+done:
+	if (sds->rendezvous_seq == seq) {
+		WRITE_ONCE(sds->rendezvous_cookie,
+			   sds->rendezvous_cookie & ~RENDEZVOUS_STATE_IN);
+	}
+	return true;
+}
+
+static inline bool __vcpu_match(struct sched_domain_shared *sds, struct task_struct *p)
+{
+	unsigned long cookie = rendezvous_cookie(sds);
+	unsigned long p_cookie = virt_cookie(p);
+
+	lockdep_assert_held(&sds->rendezvous_lock);
+
+	if (cookie) {
+		if (cookie == p_cookie || is_idle_task(p))
+			return true;
+
+		return false;
+	}
+
+	if (p_cookie)
+		return false;
+
+	return true;
+}
+
+/*
+ * called from schedule(), after context_switch(), rq->lock not held.
+ */
+void vcpu_set_next(struct rq *rq, struct task_struct *p)
+{
+	struct sched_domain_shared *sds = this_cpu_read(sd_smt_shared);
+	bool success = true;
+
+	if (!sds)
+		return;
+
+again:
+	raw_spin_lock_irq(&sds->rendezvous_lock);
+
+	if (__vcpu_stale_rendezvous(rq, sds)) {
+		unsigned int ipi = sds->rendezvous_ipi;
+
+		/*
+		 * If the IPI hasn't happened yet, go wait for it.
+		 */
+		if (rq->rendezvous_ipi != ipi) {
+			raw_spin_unlock_irq(&sds->rendezvous_lock);
+
+			for (;;) {
+				if ((int)(READ_ONCE(rq->rendezvous_ipi) - ipi) >= 0)
+					break;
+				cpu_relax();
+			}
+
+			goto again;
+		}
+
+		/*
+		 * If need resched has been set (by the IPI) then there's
+		 * nothing we can do and we need to reschedule again.
+		 */
+		if (need_resched())
+			goto unlock;
+	}
+
+	/*
+	 * The IPI either cancelled the rendezvous or set need_resched().
+	 */
+	WARN_ON_ONCE(__vcpu_stale_rendezvous(rq, sds));
+
+	/*
+	 * We must check for a filter match before waiting on any possible
+	 * PAUSE such that RT tasks will cancel whatever state is pending and
+	 * get on with it.
+	 */
+	if (!__vcpu_match(sds, p)) {
+cancel:
+		__vcpu_cancel(sds, cpu_of(rq), true);
+		goto rendezvous;
+	}
+
+	if (rendezvous_state(sds) & RENDEZVOUS_STATE_PAUSE) {
+		WARN_ON_ONCE(!rendezvous_cookie(sds));
+
+		if (need_resched())
+			goto cancel;
+
+		raw_spin_unlock_irq(&sds->rendezvous_lock);
+
+		for (;;) {
+			if (!(rendezvous_state(sds) & RENDEZVOUS_STATE_PAUSE))
+				break;
+			if (need_resched())
+				break;
+			cpu_relax();
+		}
+
+		goto again;
+	}
+
+	if (!rendezvous_cookie(sds)) {
+rendezvous:
+		if (virt_cookie(p))
+			success = __vcpu_rendezvous_in(sds, cpu_of(rq), p);
+
+		goto unlock;
+	}
+
+	if (virt_cookie(p)) {
+		WARN_ON_ONCE(rendezvous_cookie(sds) != virt_cookie(p));
+		WARN_ON_ONCE(is_idle_task(p));
+		sds->rendezvous_users++;
+	}
+
+unlock:
+	raw_spin_unlock_irq(&sds->rendezvous_lock);
+
+	if (!success) {
+		struct rq_flags rf;
+
+		WARN_ON_ONCE(rq->curr != p);
+
+		rq_lock_irqsave(rq, &rf);
+		yield_task_fair(rq);
+		rq_unlock_irqrestore(rq, &rf);
+
+		set_tsk_need_resched(rq->curr);
+		set_preempt_need_resched();
+	}
+}
+
 void vcpu_register(unsigned long virt_cookie)
 {
 	struct rq *rq = this_rq();
@@ -5472,16 +5963,30 @@ void vcpu_register(unsigned long virt_cookie)
 	if (current->sched_class == &fair_sched_class)
 		__vcpu_enqueue(rq, current);
 	raw_spin_unlock_irq(&rq->lock);
+
+	vcpu_set_next(rq, current);
+
+	if (need_resched())
+		schedule_preempt_disabled();
 }
 
 void vcpu_unregister(unsigned long virt_cookie)
 {
 	struct rq *rq = this_rq();
+	bool resched = false;
+
+	local_irq_disable();
+
+	if (vcpu_put_prev(rq, current))
+		resched = true;
 
 	raw_spin_lock(&rq->lock);
 	__vcpu_dequeue(rq, current);
 	current->virt_cookie = 0UL;
 	raw_spin_unlock_irq(&rq->lock);
+
+	if (resched)
+		schedule_preempt_disabled();
 }
 
 #else /* !CONFIG_SCHED_VCPU */
@@ -7026,12 +7531,24 @@ preempt:
 static struct task_struct *
 pick_next_task_fair(struct rq *rq, struct task_struct *prev, struct rq_flags *rf)
 {
-	struct cfs_rq *cfs_rq = &rq->cfs;
 	struct sched_entity *se;
 	struct task_struct *p;
+	struct cfs_rq *cfs_rq;
 	int new_tasks;
 
 again:
+	cfs_rq = &rq->cfs;
+
+	if (vcpu_sched_enabled()) {
+		p = vcpu_pick_next_task(rq, prev);
+		if (p) {
+			if (p == rq->idle)
+				return p;
+
+			goto done;
+		}
+	}
+
 	if (!cfs_rq->nr_running)
 		goto idle;
 

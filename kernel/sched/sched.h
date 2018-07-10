@@ -843,6 +843,8 @@ struct rq {
 
 #ifdef CONFIG_SCHED_VCPU
 	struct rb_root		vcpu_tree;
+	unsigned int		rendezvous_seq;
+	unsigned int		rendezvous_ipi;
 #endif /* CONFIG_SCHED_VCPU */
 #endif
 
@@ -931,8 +933,13 @@ static inline bool vcpu_sched_enabled(void)
 	return static_branch_unlikely(&vcpu_key);
 }
 
+extern void vcpu_ipi(void);
+
 extern void vcpu_register(unsigned long virt_cookie);
 extern void vcpu_unregister(unsigned long virt_cookie);
+
+extern bool vcpu_put_prev(struct rq *rq, struct task_struct *p);
+extern void vcpu_set_next(struct rq *rq, struct task_struct *p);
 
 #else /* !CONFIG_SCHED_VCPU */
 
@@ -941,8 +948,13 @@ static inline bool vcpu_sched_enabled(void)
 	return false;
 }
 
+static inline void vcpu_ipi(void) { }
+
 static inline void vcpu_register(unsigned long virt_cookie) { }
 static inline void vcpu_unregister(unsigned long virt_cookie) { }
+
+static inline bool vcpu_put_prev(struct rq *rq, struct task_struct *p) { return false; }
+static inline void vcpu_set_next(struct rq *rq, struct task_struct *p) { }
 
 #endif
 

@@ -1752,6 +1752,9 @@ static void sched_wake_special(struct rq *rq)
 		rq->idle_balance = 1;
 		raise_softirq_irqoff(SCHED_SOFTIRQ);
 	}
+
+	if (vcpu_sched_enabled())
+		vcpu_ipi();
 }
 
 void sched_ttwu_pending(void)
@@ -3488,6 +3491,10 @@ static void __sched notrace __schedule(bool preempt)
 		hrtick_clear(rq);
 
 	local_irq_disable();
+
+	if (vcpu_sched_enabled())
+		vcpu_put_prev(rq, prev);
+
 	rcu_note_context_switch(preempt);
 
 	/*
@@ -3567,6 +3574,9 @@ static void __sched notrace __schedule(bool preempt)
 	}
 
 	balance_callback(rq);
+
+	if (vcpu_sched_enabled())
+		vcpu_set_next(rq, current);
 }
 
 void __noreturn do_task_dead(void)
