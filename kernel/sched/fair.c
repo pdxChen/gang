@@ -5496,6 +5496,12 @@ static inline bool vcpu_wrong_class(struct task_struct *p)
  * If task selection for whatever reason ends up picking an incompatible task,
  * it will cancel the vcpu state (see OUT).
  *
+ * When the VCPU task needs to (briefly) return to userspace for emulation
+ * purposes we employ a PAUSE mode where we kick all siblings into schedule()
+ * (vcpu_set_next() to be specific) and hold them there until either we return
+ * or they need to reschedule; the latter cancels the vcpu state and starts
+ * over.
+ *
  *
  * LOCKING:
  *
@@ -5504,10 +5510,12 @@ static inline bool vcpu_wrong_class(struct task_struct *p)
  * sds::rendezvous_users
  * sds::rendezvous_seq    read unlocked
  * sds::rendezvous_ipi    read unlocked
+ * sds::rendezvous_pause
  *
  * rq::vcpu_tree          rq->lock + sds->rendezvous_lock
  * rq::rendezvous_seq	  read unlocked
  * rq::rendezvous_ipi	  read unlocked
+ * rq::rendezvous_pause
  *
  * p::vcpu_node		  rq->lock + sds->rendezvous_lock
  * p::virt_cookie
@@ -5641,6 +5649,13 @@ static void __vcpu_cancel(struct sched_domain_shared *sds, int this_cpu, bool re
 
 	WRITE_ONCE(sds->rendezvous_cookie, 0UL);
 	sds->rendezvous_users = 0;
+	sds->rendezvous_pause = 0;
+
+	for_each_cpu(cpu, cpu_smt_mask(this_cpu)) {
+		struct rq *rq = cpu_rq(cpu);
+
+		rq->rendezvous_pause = 0;
+	}
 
 	/*
 	 * By sending IPIs after clearing we guarantee those CPUs will
@@ -5719,6 +5734,12 @@ bool vcpu_put_prev(struct rq *rq, struct task_struct *p)
 		return true;
 
 	raw_spin_lock(&sds->rendezvous_lock);
+
+	if (rq->rendezvous_pause) {
+		WARN_ON_ONCE(!(rendezvous_state(sds) & RENDEZVOUS_STATE_PAUSE));
+		__vcpu_cancel(sds, cpu_of(rq), false);
+		goto unlock;
+	}
 
 	/*
 	 * Now that we hit schedule() we no longer run the previous task; let
@@ -5954,6 +5975,109 @@ unlock:
 	}
 }
 
+static bool vcpu_unpause(struct rq *rq)
+{
+	struct sched_domain_shared *sds = this_cpu_read(sd_smt_shared);
+	bool success = false;
+
+	if (!sds)
+		return success;
+
+	raw_spin_lock_irq(&sds->rendezvous_lock);
+
+	/* got cancelled */
+	if (!rendezvous_cookie(sds))
+		goto unlock;
+
+	if (!rq->rendezvous_pause)
+		goto unlock;
+
+	/*
+	 * For some reason userspace re-entered a different VCPU context on
+	 * this thread than it left with.. permissible by the KVM ABI, but
+	 * quite daft.
+	 */
+	if (virt_cookie(current) != rendezvous_cookie(sds)) {
+		__vcpu_cancel(sds, cpu_of(rq), true);
+		goto unlock;
+	}
+
+	if (--rq->rendezvous_pause)
+		goto unlock_success;
+
+	if (--sds->rendezvous_pause)
+		goto unlock_success;
+
+	/*
+	 * OK, no more rq or sds pause counts; time to let the buggers rip.
+	 */
+
+	WARN_ON_ONCE(!(rendezvous_state(sds) & RENDEZVOUS_STATE_PAUSE));
+	WARN_ON_ONCE(!rendezvous_cookie(sds));
+
+	WRITE_ONCE(sds->rendezvous_cookie,
+		   sds->rendezvous_cookie & ~RENDEZVOUS_STATE_PAUSE);
+
+unlock_success:
+	WARN_ON_ONCE((int)rq->rendezvous_pause < 0);
+	WARN_ON_ONCE((int)sds->rendezvous_pause < 0);
+
+	success = true;
+
+unlock:
+	raw_spin_unlock_irq(&sds->rendezvous_lock);
+	return success;
+}
+
+static bool vcpu_pause_others(struct rq *rq)
+{
+	struct sched_domain_shared *sds = this_cpu_read(sd_smt_shared);
+	bool success = false;
+	int this_cpu = cpu_of(rq);
+
+	if (!sds || !sched_feat(VCPU_PAUSE))
+		return success;
+
+	raw_spin_lock(&sds->rendezvous_lock);
+	if (!rendezvous_cookie(sds)) /* someone cancelled already */
+		goto unlock;
+
+	if (rq->rendezvous_pause++) /* we already called a pause */
+		goto unlock_success;
+
+	if (sds->rendezvous_pause++) /* someone else already called a pause */
+		goto unlock_success;
+
+	WARN_ON_ONCE(rendezvous_state(sds) & RENDEZVOUS_STATE_PAUSE);
+
+	WRITE_ONCE(sds->rendezvous_cookie,
+		   sds->rendezvous_cookie | RENDEZVOUS_STATE_PAUSE);
+
+	__vcpu_ipi_others(sds, this_cpu, true);
+
+	/*
+	 * At this point all the siblings have left guest mode and will
+	 * reschedule to wait for us to return, and will cancel the state when
+	 * they need to reschedule.
+	 *
+	 * We leave the cookie set which will have forced them to reselect
+	 * matching tasks and they'll get 'stuck' in vcpu_set_next().
+	 *
+	 * If we re-join them before rescheduling, we'll let 'em rip, otherwise
+	 * everything gets cancelled and we'll reselect.
+	 */
+
+unlock_success:
+	WARN_ON_ONCE(!(rendezvous_state(sds) & RENDEZVOUS_STATE_PAUSE));
+
+	success = true;
+
+unlock:
+	raw_spin_unlock(&sds->rendezvous_lock);
+
+	return success;
+}
+
 void vcpu_register(unsigned long virt_cookie)
 {
 	struct rq *rq = this_rq();
@@ -5964,7 +6088,8 @@ void vcpu_register(unsigned long virt_cookie)
 		__vcpu_enqueue(rq, current);
 	raw_spin_unlock_irq(&rq->lock);
 
-	vcpu_set_next(rq, current);
+	if (!vcpu_unpause(rq))
+		vcpu_set_next(rq, current);
 
 	if (need_resched())
 		schedule_preempt_disabled();
@@ -5977,7 +6102,7 @@ void vcpu_unregister(unsigned long virt_cookie)
 
 	local_irq_disable();
 
-	if (vcpu_put_prev(rq, current))
+	if (!vcpu_pause_others(rq) && vcpu_put_prev(rq, current))
 		resched = true;
 
 	raw_spin_lock(&rq->lock);

@@ -845,6 +845,7 @@ struct rq {
 	struct rb_root		vcpu_tree;
 	unsigned int		rendezvous_seq;
 	unsigned int		rendezvous_ipi;
+	unsigned int		rendezvous_pause;
 #endif /* CONFIG_SCHED_VCPU */
 #endif
 

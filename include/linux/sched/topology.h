@@ -79,6 +79,7 @@ struct sched_domain_shared {
 	unsigned int	rendezvous_users;
 	unsigned int	rendezvous_seq;
 	unsigned int	rendezvous_ipi;
+	unsigned int	rendezvous_pause;
 #endif
 };
 
