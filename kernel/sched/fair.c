@@ -5373,6 +5373,125 @@ static inline void hrtick_update(struct rq *rq)
 }
 #endif
 
+#ifdef CONFIG_SCHED_VCPU
+/*
+ * We keep a per rq tree of vCPUs, ordered by virtual-machine cookie.
+ *
+ * Using this, we can quickly find a runnable vCPU for a given virtual-machine.
+ */
+static bool vcpu_less(struct task_struct *t1, struct task_struct *t2)
+{
+	if (t1->virt_cookie < t2->virt_cookie)
+		return true;
+	if (t1->virt_cookie > t2->virt_cookie)
+		return false;
+
+	/* XXX not updated, better than nothing, assumes all vcpus share a cgroup */
+	if (entity_before(&t1->se, &t2->se))
+		return true;
+
+	return false;
+}
+
+static void __vcpu_enqueue(struct rq *rq, struct task_struct *p)
+{
+	struct sched_domain_shared *sds = per_cpu(sd_smt_shared, cpu_of(rq));
+	struct task_struct *node_task;
+	struct rb_node *parent, **node;
+
+	if (!sds || !p->virt_cookie)
+		return;
+
+	raw_spin_lock(&sds->rendezvous_lock);
+
+	node = &rq->vcpu_tree.rb_node;
+	parent = *node;
+
+	while (*node) {
+		node_task = container_of(*node, struct task_struct, vcpu_node);
+		parent = *node;
+
+		if (vcpu_less(p, node_task))
+			node = &parent->rb_left;
+		else
+			node = &parent->rb_right;
+	}
+
+	rb_link_node(&p->vcpu_node, parent, node);
+	rb_insert_color(&p->vcpu_node, &rq->vcpu_tree);
+
+	p->virt_enqueued = 1;
+
+	raw_spin_unlock(&sds->rendezvous_lock);
+}
+
+static void __vcpu_dequeue(struct rq *rq, struct task_struct *p)
+{
+	struct sched_domain_shared *sds = per_cpu(sd_smt_shared, cpu_of(rq));
+
+	if (!sds || !p->virt_cookie)
+		return;
+
+	raw_spin_lock(&sds->rendezvous_lock);
+
+	if (p->virt_enqueued) {
+		rb_erase(&p->vcpu_node, &rq->vcpu_tree);
+		p->virt_enqueued = 0;
+	}
+
+	raw_spin_unlock(&sds->rendezvous_lock);
+}
+
+static struct task_struct *vcpu_find(struct rq *rq, unsigned long virt_cookie)
+{
+	struct rb_node *node = rq->vcpu_tree.rb_node;
+	struct task_struct *match = NULL, *node_task;
+
+	while (node) {
+		node_task = container_of(node, struct task_struct, vcpu_node);
+
+		if (node_task->virt_cookie < virt_cookie) {
+			node = node->rb_left;
+		} else if (node_task->virt_cookie > virt_cookie) {
+			node = node->rb_right;
+		} else {
+			match = node_task;
+			node = node->rb_left;
+		}
+	}
+
+	return match;
+}
+
+void vcpu_register(unsigned long virt_cookie)
+{
+	struct rq *rq = this_rq();
+
+	raw_spin_lock_irq(&rq->lock);
+	current->virt_cookie = virt_cookie;
+	if (current->sched_class == &fair_sched_class)
+		__vcpu_enqueue(rq, current);
+	raw_spin_unlock_irq(&rq->lock);
+}
+
+void vcpu_unregister(unsigned long virt_cookie)
+{
+	struct rq *rq = this_rq();
+
+	raw_spin_lock(&rq->lock);
+	__vcpu_dequeue(rq, current);
+	current->virt_cookie = 0UL;
+	raw_spin_unlock_irq(&rq->lock);
+}
+
+#else /* !CONFIG_SCHED_VCPU */
+static inline void __vcpu_enqueue(struct rq *rq, struct task_struct *p) { }
+static inline void __vcpu_dequeue(struct rq *rq, struct task_struct *p) { }
+
+static inline struct task_struct *
+vcpu_pick_next_task(struct rq *rq, struct task_struct *prev) { return NULL; }
+#endif /* !CONFIG_SCHED_VCPU */
+
 /*
  * The enqueue_task method is called before nr_running is
  * increased. Here we update the fair scheduling stats and
@@ -5434,6 +5553,9 @@ enqueue_task_fair(struct rq *rq, struct task_struct *p, int flags)
 		add_nr_running(rq, 1);
 
 	hrtick_update(rq);
+
+	if (vcpu_sched_enabled())
+		__vcpu_enqueue(rq, p);
 }
 
 static void set_next_buddy(struct sched_entity *se);
@@ -5494,6 +5616,9 @@ static void dequeue_task_fair(struct rq *rq, struct task_struct *p, int flags)
 
 	util_est_dequeue(&rq->cfs, p, task_sleep);
 	hrtick_update(rq);
+
+	if (vcpu_sched_enabled())
+		__vcpu_dequeue(rq, p);
 }
 
 #ifdef CONFIG_SMP

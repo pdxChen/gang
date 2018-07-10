@@ -158,10 +158,10 @@ bool kvm_is_reserved_pfn(kvm_pfn_t pfn)
  */
 void vcpu_load(struct kvm_vcpu *vcpu)
 {
-	int cpu = get_cpu();
-	preempt_notifier_register(&vcpu->preempt_notifier);
-	kvm_arch_vcpu_load(vcpu, cpu);
-	put_cpu();
+	preempt_disable();
+	preempt_notifier_register_vcpu(&vcpu->preempt_notifier, vcpu->kvm);
+	kvm_arch_vcpu_load(vcpu, smp_processor_id());
+	preempt_enable();
 }
 EXPORT_SYMBOL_GPL(vcpu_load);
 
@@ -169,7 +169,7 @@ void vcpu_put(struct kvm_vcpu *vcpu)
 {
 	preempt_disable();
 	kvm_arch_vcpu_put(vcpu);
-	preempt_notifier_unregister(&vcpu->preempt_notifier);
+	preempt_notifier_unregister_vcpu(&vcpu->preempt_notifier, vcpu->kvm);
 	preempt_enable();
 }
 EXPORT_SYMBOL_GPL(vcpu_put);

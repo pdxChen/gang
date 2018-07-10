@@ -2217,6 +2217,7 @@ static void __sched_fork(unsigned long clone_flags, struct task_struct *p)
 
 #ifdef CONFIG_PREEMPT_NOTIFIERS
 	INIT_HLIST_HEAD(&p->preempt_notifiers);
+	p->virt_cookie = 0UL;
 #endif
 
 	init_numa_balancing(clone_flags, p);
@@ -2485,12 +2486,27 @@ void wake_up_new_task(struct task_struct *p)
 	task_rq_unlock(rq, p, &rf);
 }
 
+#ifdef CONFIG_SCHED_VCPU
+
+#ifndef arch_needs_vcpu_sched
+#define arch_needs_vcpu_sched() (false)
+#endif
+
+DEFINE_STATIC_KEY_FALSE(vcpu_key);
+
+#endif
+
 #ifdef CONFIG_PREEMPT_NOTIFIERS
 
 static DEFINE_STATIC_KEY_FALSE(preempt_notifier_key);
 
 void preempt_notifier_inc(void)
 {
+#ifdef CONFIG_SCHED_VCPU
+	if (static_branch_likely(&sched_smt_present) &&
+	    sched_feat(VCPU) && arch_needs_vcpu_sched())
+		static_branch_inc(&vcpu_key);
+#endif
 	static_branch_inc(&preempt_notifier_key);
 }
 EXPORT_SYMBOL_GPL(preempt_notifier_inc);
@@ -2498,6 +2514,11 @@ EXPORT_SYMBOL_GPL(preempt_notifier_inc);
 void preempt_notifier_dec(void)
 {
 	static_branch_dec(&preempt_notifier_key);
+#ifdef CONFIG_SCHED_VCPU
+	if (static_branch_likely(&sched_smt_present) &&
+	    sched_feat(VCPU) && arch_needs_vcpu_sched())
+		static_branch_dec(&vcpu_key);
+#endif
 }
 EXPORT_SYMBOL_GPL(preempt_notifier_dec);
 
@@ -2514,6 +2535,15 @@ void preempt_notifier_register(struct preempt_notifier *notifier)
 }
 EXPORT_SYMBOL_GPL(preempt_notifier_register);
 
+void preempt_notifier_register_vcpu(struct preempt_notifier *notifier, void *virt_cookie)
+{
+	if (vcpu_sched_enabled())
+		vcpu_register((unsigned long)virt_cookie);
+
+	preempt_notifier_register(notifier);
+}
+EXPORT_SYMBOL_GPL(preempt_notifier_register_vcpu);
+
 /**
  * preempt_notifier_unregister - no longer interested in preemption notifications
  * @notifier: notifier struct to unregister
@@ -2525,6 +2555,15 @@ void preempt_notifier_unregister(struct preempt_notifier *notifier)
 	hlist_del(&notifier->link);
 }
 EXPORT_SYMBOL_GPL(preempt_notifier_unregister);
+
+void preempt_notifier_unregister_vcpu(struct preempt_notifier *notifier, void *virt_cookie)
+{
+	preempt_notifier_unregister(notifier);
+
+	if (vcpu_sched_enabled())
+		vcpu_unregister((unsigned long)virt_cookie);
+}
+EXPORT_SYMBOL_GPL(preempt_notifier_unregister_vcpu);
 
 static void __fire_sched_in_preempt_notifiers(struct task_struct *curr)
 {

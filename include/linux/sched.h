@@ -653,6 +653,11 @@ struct task_struct {
 	/* List of struct preempt_notifier: */
 	struct hlist_head		preempt_notifiers;
 #endif
+#ifdef CONFIG_SCHED_VCPU
+	struct rb_node			vcpu_node;
+	unsigned long			virt_cookie;
+	unsigned int			virt_enqueued;
+#endif
 
 #ifdef CONFIG_BLK_DEV_IO_TRACE
 	unsigned int			btrace_seq;

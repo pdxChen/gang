@@ -316,6 +316,9 @@ void preempt_notifier_dec(void);
 void preempt_notifier_register(struct preempt_notifier *notifier);
 void preempt_notifier_unregister(struct preempt_notifier *notifier);
 
+void preempt_notifier_register_vcpu(struct preempt_notifier *notifier, void *virt_cookie);
+void preempt_notifier_unregister_vcpu(struct preempt_notifier *notifier, void *virt_cookie);
+
 static inline void preempt_notifier_init(struct preempt_notifier *notifier,
 				     struct preempt_ops *ops)
 {

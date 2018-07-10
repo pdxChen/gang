@@ -840,6 +840,10 @@ struct rq {
 
 	/* This is used to determine avg_idle's max value */
 	u64			max_idle_balance_cost;
+
+#ifdef CONFIG_SCHED_VCPU
+	struct rb_root		vcpu_tree;
+#endif /* CONFIG_SCHED_VCPU */
 #endif
 
 #ifdef CONFIG_IRQ_TIME_ACCOUNTING
@@ -916,6 +920,30 @@ static inline void update_idle_core(struct rq *rq)
 
 #else
 static inline void update_idle_core(struct rq *rq) { }
+#endif
+
+#ifdef CONFIG_SCHED_VCPU
+
+extern struct static_key_false vcpu_key;
+
+static inline bool vcpu_sched_enabled(void)
+{
+	return static_branch_unlikely(&vcpu_key);
+}
+
+extern void vcpu_register(unsigned long virt_cookie);
+extern void vcpu_unregister(unsigned long virt_cookie);
+
+#else /* !CONFIG_SCHED_VCPU */
+
+static inline bool vcpu_sched_enabled(void)
+{
+	return false;
+}
+
+static inline void vcpu_register(unsigned long virt_cookie) { }
+static inline void vcpu_unregister(unsigned long virt_cookie) { }
+
 #endif
 
 DECLARE_PER_CPU_SHARED_ALIGNED(struct rq, runqueues);
@@ -1158,6 +1186,7 @@ static inline struct sched_domain *lowest_flag_domain(int cpu, int flag)
 DECLARE_PER_CPU(struct sched_domain *, sd_llc);
 DECLARE_PER_CPU(int, sd_llc_size);
 DECLARE_PER_CPU(int, sd_llc_id);
+DECLARE_PER_CPU(struct sched_domain_shared *, sd_smt_shared);
 DECLARE_PER_CPU(struct sched_domain_shared *, sd_llc_shared);
 DECLARE_PER_CPU(struct sched_domain *, sd_numa);
 DECLARE_PER_CPU(struct sched_domain *, sd_asym);

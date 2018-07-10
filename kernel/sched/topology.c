@@ -396,6 +396,7 @@ DEFINE_PER_CPU(struct sched_domain *, sd_llc);
 DEFINE_PER_CPU(int, sd_llc_size);
 DEFINE_PER_CPU(int, sd_llc_id);
 DEFINE_PER_CPU(struct sched_domain_shared *, sd_llc_shared);
+DEFINE_PER_CPU(struct sched_domain_shared *, sd_smt_shared);
 DEFINE_PER_CPU(struct sched_domain *, sd_numa);
 DEFINE_PER_CPU(struct sched_domain *, sd_asym);
 
@@ -406,6 +407,14 @@ static void update_top_cache_domain(int cpu)
 	int id = cpu;
 	int size = 1;
 
+	sds = NULL;
+	sd = highest_flag_domain(cpu, SD_SHARE_CPUCAPACITY);
+	if (sd) {
+		sds = sd->shared;
+	}
+	rcu_assign_pointer(per_cpu(sd_smt_shared, cpu), sds);
+
+	sds = NULL;
 	sd = highest_flag_domain(cpu, SD_SHARE_PKG_RESOURCES);
 	if (sd) {
 		id = cpumask_first(sched_domain_span(sd));
@@ -1192,6 +1201,10 @@ sd_init(struct sched_domain_topology_level *tl,
 		sd->shared = *per_cpu_ptr(sdd->sds, sd_id);
 		atomic_inc(&sd->shared->ref);
 		atomic_set(&sd->shared->nr_busy_cpus, sd_weight);
+
+#ifdef CONFIG_SCHED_VCPU
+		raw_spin_lock_init(&sd->shared->rendezvous_lock);
+#endif
 	}
 
 	sd->private = sdd;

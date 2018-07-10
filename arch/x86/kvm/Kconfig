@@ -64,6 +64,7 @@ config KVM_INTEL
 	depends on KVM
 	# for perf_guest_get_msrs():
 	depends on CPU_SUP_INTEL
+	select SCHED_VCPU
 	---help---
 	  Provides support for KVM on Intel processors equipped with the VT
 	  extensions.

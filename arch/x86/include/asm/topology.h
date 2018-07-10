@@ -126,6 +126,9 @@ int topology_update_package_map(unsigned int apicid, unsigned int cpu);
 int topology_phys_to_logical_pkg(unsigned int pkg);
 bool topology_is_primary_thread(unsigned int cpu);
 bool topology_smt_supported(void);
+
+#define arch_needs_vcpu_sched()		static_cpu_has_bug(X86_BUG_L1TF)
+
 #else
 #define topology_max_packages()			(1)
 static inline int
