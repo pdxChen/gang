@@ -44,6 +44,7 @@ extern void rcu_nmi_exit(void);
  * Enter irq context (on NO_HZ, update jiffies):
  */
 extern void irq_enter(void);
+extern void irq_enter_novcpu(void);
 
 /*
  * Exit irq context without processing softirqs:
@@ -59,6 +60,7 @@ extern void irq_enter(void);
  * Exit irq context and process softirqs if needed:
  */
 extern void irq_exit(void);
+extern void irq_exit_novcpu(void);
 
 #define nmi_enter()						\
 	do {							\

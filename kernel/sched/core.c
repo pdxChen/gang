@@ -1811,9 +1811,9 @@ void scheduler_ipi(void)
 	 * however a fair share of IPIs are still resched only so this would
 	 * somewhat pessimize the simple resched case.
 	 */
-	irq_enter();
+	irq_enter_novcpu();
 	sched_ttwu_pending();
-	irq_exit();
+	irq_exit_novcpu();
 }
 
 static void ttwu_queue_remote(struct task_struct *p, int cpu, int wake_flags)

@@ -5975,15 +5975,16 @@ unlock:
 	}
 }
 
-static bool vcpu_unpause(struct rq *rq)
+static bool vcpu_unpause(struct rq *rq, bool irq)
 {
 	struct sched_domain_shared *sds = this_cpu_read(sd_smt_shared);
 	bool success = false;
+	unsigned long flags;
 
-	if (!sds)
+	if (!sds || !sched_feat(VCPU_PAUSE))
 		return success;
 
-	raw_spin_lock_irq(&sds->rendezvous_lock);
+	raw_spin_lock_irqsave(&sds->rendezvous_lock, flags);
 
 	/* got cancelled */
 	if (!rendezvous_cookie(sds))
@@ -5997,7 +5998,7 @@ static bool vcpu_unpause(struct rq *rq)
 	 * this thread than it left with.. permissible by the KVM ABI, but
 	 * quite daft.
 	 */
-	if (virt_cookie(current) != rendezvous_cookie(sds)) {
+	if (!irq && virt_cookie(current) != rendezvous_cookie(sds)) {
 		__vcpu_cancel(sds, cpu_of(rq), true);
 		goto unlock;
 	}
@@ -6025,11 +6026,11 @@ unlock_success:
 	success = true;
 
 unlock:
-	raw_spin_unlock_irq(&sds->rendezvous_lock);
+	raw_spin_unlock_irqrestore(&sds->rendezvous_lock, flags);
 	return success;
 }
 
-static bool vcpu_pause_others(struct rq *rq)
+static bool vcpu_pause_others(struct rq *rq, bool irq)
 {
 	struct sched_domain_shared *sds = this_cpu_read(sd_smt_shared);
 	bool success = false;
@@ -6078,6 +6079,18 @@ unlock:
 	return success;
 }
 
+void vcpu_irq_enter(void)
+{
+	if (vcpu_sched_enabled() && sched_feat(VCPU_IRQ))
+		vcpu_pause_others(this_rq(), true);
+}
+
+void vcpu_irq_exit(void)
+{
+	if (vcpu_sched_enabled() && sched_feat(VCPU_IRQ))
+		vcpu_unpause(this_rq(), true);
+}
+
 void vcpu_register(unsigned long virt_cookie)
 {
 	struct rq *rq = this_rq();
@@ -6088,7 +6101,7 @@ void vcpu_register(unsigned long virt_cookie)
 		__vcpu_enqueue(rq, current);
 	raw_spin_unlock_irq(&rq->lock);
 
-	if (!vcpu_unpause(rq))
+	if (!vcpu_unpause(rq, false))
 		vcpu_set_next(rq, current);
 
 	if (need_resched())
@@ -6102,7 +6115,7 @@ void vcpu_unregister(unsigned long virt_cookie)
 
 	local_irq_disable();
 
-	if (!vcpu_pause_others(rq) && vcpu_put_prev(rq, current))
+	if (!vcpu_pause_others(rq, false) && vcpu_put_prev(rq, current))
 		resched = true;
 
 	raw_spin_lock(&rq->lock);

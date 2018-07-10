@@ -338,12 +338,24 @@ asmlinkage __visible void do_softirq(void)
 	local_irq_restore(flags);
 }
 
+#ifdef CONFIG_SCHED_VCPU
+extern void vcpu_irq_enter(void);
+extern void vcpu_irq_exit(void);
+#else
+static inline void vcpu_irq_enter(void) { }
+static inline void vcpu_irq_exit(void) { }
+#endif
+
 /*
  * Enter an interrupt context.
  */
-void irq_enter(void)
+static void _irq_enter(bool vcpu)
 {
 	rcu_irq_enter();
+
+	if (vcpu)
+		vcpu_irq_enter();
+
 	if (is_idle_task(current) && !in_interrupt()) {
 		/*
 		 * Prevent raise_softirq from needlessly waking up ksoftirqd
@@ -355,6 +367,16 @@ void irq_enter(void)
 	}
 
 	__irq_enter();
+}
+
+void irq_enter(void)
+{
+	_irq_enter(true);
+}
+
+void irq_enter_novcpu(void)
+{
+	_irq_enter(false);
 }
 
 static inline void invoke_softirq(void)
@@ -399,7 +421,7 @@ static inline void tick_irq_exit(void)
 /*
  * Exit an interrupt context. Process softirqs if needed and possible:
  */
-void irq_exit(void)
+static void _irq_exit(bool vcpu)
 {
 #ifndef __ARCH_IRQ_EXIT_IRQS_DISABLED
 	local_irq_disable();
@@ -412,8 +434,22 @@ void irq_exit(void)
 		invoke_softirq();
 
 	tick_irq_exit();
+
+	if (vcpu)
+		vcpu_irq_exit();
+
 	rcu_irq_exit();
 	trace_hardirq_exit(); /* must be last! */
+}
+
+void irq_exit(void)
+{
+	return _irq_exit(true);
+}
+
+void irq_exit_novcpu(void)
+{
+	return _irq_exit(false);
 }
 
 /*

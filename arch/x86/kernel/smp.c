@@ -268,11 +268,11 @@ __visible void __irq_entry smp_reschedule_interrupt(struct pt_regs *regs)
 		 * scheduler_ipi() might call irq_enter() as well, but
 		 * nested calls are fine.
 		 */
-		irq_enter();
+		irq_enter_novcpu();
 		trace_reschedule_entry(RESCHEDULE_VECTOR);
 		scheduler_ipi();
 		trace_reschedule_exit(RESCHEDULE_VECTOR);
-		irq_exit();
+		irq_exit_novcpu();
 		return;
 	}
 	scheduler_ipi();
