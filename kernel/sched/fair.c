@@ -5437,6 +5437,7 @@ static void __vcpu_dequeue(struct rq *rq, struct task_struct *p)
 	if (p->virt_enqueued) {
 		rb_erase(&p->vcpu_node, &rq->vcpu_tree);
 		p->virt_enqueued = 0;
+		task_clear_paired(p);
 	}
 
 	raw_spin_unlock(&sds->rendezvous_lock);
@@ -5906,6 +5907,7 @@ void vcpu_set_next(struct rq *rq, struct task_struct *p)
 {
 	struct sched_domain_shared *sds = this_cpu_read(sd_smt_shared);
 	bool success = true;
+	int cpu;
 
 	if (!sds)
 		return;
@@ -5987,10 +5989,21 @@ rendezvous:
 		WARN_ON_ONCE(rendezvous_cookie(sds) != virt_cookie(p));
 		WARN_ON_ONCE(is_idle_task(p));
 		sds->rendezvous_users++;
+		if (sds->rendezvous_users > 1) {
+			for_each_cpu(cpu, cpu_smt_mask(cpu_of(rq))) {
+				WARN_ON(virt_cookie(cpu_rq(cpu)->curr) != virt_cookie(p));
+				task_set_paired(cpu_rq(cpu)->curr);
+			}
+		}
 	}
 
 unlock:
 	vcpu_debug(sds, rq, "set_next-exit");
+
+	/* We can't pair with task on sibling */
+	if (sds->rendezvous_users < 2)
+		task_clear_paired(p);
+
 	raw_spin_unlock_irq(&sds->rendezvous_lock);
 
 	if (!success) {

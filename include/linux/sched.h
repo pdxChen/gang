@@ -111,6 +111,16 @@ struct task_group;
 					 (task->flags & PF_FROZEN) == 0 && \
 					 (task->state & TASK_NOLOAD) == 0)
 
+#ifdef CONFIG_SCHED_VCPU
+#define task_paired(task)		(task->paired)
+#define task_set_paired(task)		do {task->paired = 1;} while (0)
+#define task_clear_paired(task)		do {task->paired = 0;} while (0)
+#else
+#define task_paired(task)		(0)
+#define task_set_paired(task)
+#define task_clear_paired(task)
+#endif
+
 #ifdef CONFIG_DEBUG_ATOMIC_SLEEP
 
 /*
@@ -657,6 +667,7 @@ struct task_struct {
 	struct rb_node			vcpu_node;
 	unsigned long			virt_cookie;
 	unsigned int			virt_enqueued;
+	int				paired;
 #endif
 
 #ifdef CONFIG_BLK_DEV_IO_TRACE
