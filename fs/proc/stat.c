@@ -21,6 +21,9 @@
 #define arch_irq_stat() 0
 #endif
 
+extern unsigned long cnt_set_next;
+extern unsigned long cnt_tsk_paired;
+
 #ifdef arch_idle_time
 
 static u64 get_idle_time(int cpu)
@@ -177,6 +180,15 @@ static int show_stat(struct seq_file *p, void *v)
 	for (i = 0; i < NR_SOFTIRQS; i++)
 		seq_put_decimal_ull(p, " ", per_softirq_sums[i]);
 	seq_putc(p, '\n');
+
+	seq_printf(p,
+		"\ncnt_set_next %lu\n"
+		"cnt_tsk_paired %lu\n"
+		"tsk paired  %lu%%\n",
+		cnt_set_next, cnt_tsk_paired,
+		cnt_set_next?((100*cnt_tsk_paired)/cnt_set_next):0);
+	cnt_set_next = 0;
+	cnt_tsk_paired = 0;
 
 	return 0;
 }

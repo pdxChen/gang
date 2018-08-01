@@ -5900,6 +5900,9 @@ static inline bool __vcpu_match(struct sched_domain_shared *sds, struct task_str
 	return true;
 }
 
+unsigned long cnt_set_next;
+unsigned long cnt_tsk_paired;
+
 /*
  * called from schedule(), after context_switch(), rq->lock not held.
  */
@@ -6019,6 +6022,12 @@ unlock:
 		set_preempt_need_resched();
 
 		vcpu_printk("set_next FAIL!!\n");
+	}
+
+	if (rendezvous_cookie(sds)) {
+		++cnt_set_next;
+		if (task_paired(p))
+			++cnt_tsk_paired;
 	}
 }
 
