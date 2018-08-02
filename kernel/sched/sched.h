@@ -1125,6 +1125,15 @@ init_numa_balancing(unsigned long clone_flags, struct task_struct *p)
 }
 #endif /* CONFIG_NUMA_BALANCING */
 
+#ifdef CONFIG_KVM
+extern struct task_struct *vcpu_next_unpaired(int *cur_idx, unsigned long kvm_cookie);
+#else
+static inline struct task_struct *vcpu_next_unpaired(int *cur_idx, unsigned long kvm_cookie)
+{
+        return NULL;
+}
+#endif
+
 #ifdef CONFIG_SMP
 
 static inline void

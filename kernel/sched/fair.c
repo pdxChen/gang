@@ -7828,6 +7828,9 @@ simple:
 
 	do {
 		se = pick_next_entity(cfs_rq, NULL);
+		WARN_ON(!se && cfs_rq->nr_running);
+		if (!se)
+			goto idle;
 		set_next_entity(cfs_rq, se);
 		cfs_rq = group_cfs_rq(se);
 	} while (cfs_rq);
@@ -8102,6 +8105,11 @@ static int task_hot(struct task_struct *p, struct lb_env *env)
 
 	if (unlikely(p->policy == SCHED_IDLE))
 		return 0;
+
+	/* Don't migrate a paired vcpu task, unless dst is idle */
+	if (vcpu_sched_enabled() && virt_cookie(p) && task_paired(p)
+		&& !idle_cpu(env->dst_cpu))
+		return 1;
 
 	/*
 	 * Buddy candidates are cache hot:
@@ -9641,6 +9649,186 @@ static int should_we_balance(struct lb_env *env)
 	return balance_cpu == env->dst_cpu;
 }
 
+static inline int get_sibling(int cpu)
+{
+	int sibling;
+
+	for_each_cpu(sibling, cpu_smt_mask(cpu)) {
+		if (sibling != cpu)
+			break;
+	}
+
+	if (sibling == cpu)
+		return -1;
+
+	return sibling;
+}
+
+static struct task_struct *vcpu_find_unpaired(unsigned long vcpu_cookie,
+						int this_cpu,
+						struct lb_env *env,
+						struct rq_flags *rf)
+{
+	int i, sibling, tsk_cpu;
+	struct task_struct *p, *unpaired_task = NULL;
+
+	sibling = get_sibling(this_cpu);
+
+	/*
+	 * Enter this function with current task that's unpaired vcpu.
+	 * Find another vcpu task to pair with it on current cpu sibling.
+	 * The env->dst_cpu should be the sibling cpu.
+	 */
+
+	/* sanity check */
+	if (env->dst_cpu != sibling) {
+		pr_info("screwy lb_env, dst cpu %d not sibling of this_cpu %d",
+				env->dst_cpu, this_cpu);
+		return NULL;
+	}
+
+	/*
+	 * XXX Better for scalability to search through all the vcpus
+	 * of the VM corresponding to the vcpu_cookie, than directly
+	 * searching through all the cpus in lb_env sched domain
+	 */
+
+	i = -1;
+	p = vcpu_next_unpaired(&i, vcpu_cookie);
+	for (; p != NULL; p = vcpu_next_unpaired(&i, vcpu_cookie)) {
+again:
+		tsk_cpu = task_cpu(p);
+
+		/*
+		 * XXX The pairing task search is unfair as lower indexed vcpu
+		 * in the KVM's list get paired first.  Also the closeness
+		 * of vcpu to current task sched domain wise is not considered.
+		 */
+
+		/* should not pull current task that we are trying to pair */
+		if (p == current)
+			goto next;
+
+		SCHED_WARN_ON(p->virt_cookie != vcpu_cookie);
+
+		env->src_rq = cpu_rq(tsk_cpu);
+		env->src_cpu = tsk_cpu;
+
+		/* should only work on vcpu that's on rq */
+		if (!p->virt_enqueued || !task_on_rq_queued(p))
+			goto next;
+
+		rq_lock_irqsave(env->src_rq, rf);
+
+		/* in case virt_enqueued changed before we acquire lock */
+		if (!p->virt_enqueued || !task_on_rq_queued(p))
+			goto next_unlock;
+
+		/* in case task got migrated before locking rq */
+		if (tsk_cpu != task_cpu(p)) {
+			rq_unlock_irqrestore(env->src_rq, rf);
+			goto again;
+		}
+
+		/*
+		 * already have a pairing task on sibling, no migration needed
+		 */
+		if (tsk_cpu == env->dst_cpu) {
+			unpaired_task = p;
+			break;
+		}
+
+		/* do various pre-migration checks */
+		update_rq_clock(env->src_rq);
+		if (!can_migrate_task(p, env))
+			goto next_unlock;
+
+		/* skip, let the more lightly loaded cpu pull */
+		if (weighted_cpuload(env->dst_rq) > weighted_cpuload(env->src_rq))
+			goto next_unlock;
+
+		/* don't pull if it will create unloaded cpu */
+		if (env->src_rq->nr_running < 2)
+			goto next_unlock;
+
+		unpaired_task = p;
+		break;
+next_unlock:
+		rq_unlock_irqrestore(env->src_rq, rf);
+next:
+		put_task_struct(p);
+	}
+
+	return unpaired_task;
+}
+
+static void vcpu_load_balance(int this_cpu, struct rq *this_rq,
+			struct sched_domain *sd, struct lb_env *env)
+{
+	struct rq *orig_dst_rq;
+	int orig_dst_cpu;
+	struct rq_flags rf;
+	struct task_struct *vcpu_task;
+	int sibling;
+
+	if (!current->virt_cookie || task_paired(current) ||
+	    (sibling = get_sibling(this_cpu)) < 0)
+		return;
+
+	/*
+	 * Find another lonely vcpu to pull over
+	 * to the sibling thread for pairing with current task.
+	 * The dst cpu is temporarily switched to this_cpu's sibling.
+	 */
+
+	orig_dst_cpu = env->dst_cpu;
+	orig_dst_rq = env->dst_rq;
+
+	env->dst_cpu = sibling;
+	env->dst_rq = cpu_rq(sibling);
+
+	/* src rq will be locked if vcpu_task is non null */
+	vcpu_task = vcpu_find_unpaired(current->virt_cookie, this_cpu, env, &rf);
+
+	if (vcpu_task) {
+		/* bunch of sanity checks */
+		if (vcpu_task->virt_cookie != current->virt_cookie ||
+		    task_paired(vcpu_task) || vcpu_task == current ||
+		    !vcpu_task->virt_enqueued) {
+			put_task_struct(vcpu_task);
+			vcpu_task = NULL;
+			goto abort;
+		}
+
+		if (task_cpu(vcpu_task) == sibling) {
+			/* pairing task already on sibling, no migration */
+			task_set_paired(vcpu_task);
+			task_set_paired(current);
+			put_task_struct(vcpu_task);
+			vcpu_task = NULL;
+		} else {
+			detach_task(vcpu_task, env);
+		}
+abort:
+		rq_unlock(env->src_rq, &rf);
+
+		if (vcpu_task) {
+			attach_one_task(env->dst_rq, vcpu_task);
+			task_set_paired(vcpu_task);
+			task_set_paired(current);
+			put_task_struct(vcpu_task);
+		}
+
+		local_irq_restore(rf.flags);
+
+		/* XXX need to update the sched stats */
+	}
+
+	/* switch dest cpu from sibling back to original */
+	env->dst_cpu = orig_dst_cpu;
+	env->dst_rq = orig_dst_rq;
+}
+
 /*
  * Check this_cpu to ensure it is balanced within domain. Attempt to move
  * tasks if there is an imbalance.
@@ -9671,6 +9859,14 @@ static int load_balance(int this_cpu, struct rq *this_rq,
 	cpumask_and(cpus, sched_domain_span(sd), cpu_active_mask);
 
 	schedstat_inc(sd->lb_count[idle]);
+
+	/*
+	 * Only do vcpu load balance from SMT domain. We'll search through
+	 * all tasks of a VM to find another lonely VCPU from all domains.
+	 * So it is unnecessary to do vcpu load pairing again for other domains.
+	 */
+	if (vcpu_sched_enabled() && (sd->flags & SD_SHARE_PKG_RESOURCES))
+		vcpu_load_balance(this_cpu, this_rq, sd, &env);
 
 redo:
 	if (!should_we_balance(&env)) {

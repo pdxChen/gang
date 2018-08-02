@@ -51,6 +51,7 @@
 #include <linux/slab.h>
 #include <linux/sort.h>
 #include <linux/bsearch.h>
+#include <linux/sched.h>
 
 #include <asm/processor.h>
 #include <asm/io.h>
@@ -2263,6 +2264,51 @@ int kvm_vcpu_yield_to(struct kvm_vcpu *target)
 	return ret;
 }
 EXPORT_SYMBOL_GPL(kvm_vcpu_yield_to);
+
+struct task_struct *vcpu_next_unpaired(int *cur_idx, unsigned long kvm_cookie)
+{
+	struct pid *pid;
+	struct kvm *kvm;
+	struct kvm_vcpu *vcpu;
+	struct task_struct *p, *vcpu_task = NULL;
+
+	if (*cur_idx < 0)
+		*cur_idx = 0;
+	else
+		++ *cur_idx;
+
+	kvm = (struct kvm *) kvm_cookie;
+	rcu_read_lock();
+	while ((*cur_idx < atomic_read(&kvm->online_vcpus)) &&
+	       ((vcpu = kvm_get_vcpu(kvm, *cur_idx)) != NULL)) {
+
+		/* get task associated with vcpu */
+		pid = rcu_dereference(vcpu->pid);
+		if (!pid) {
+			++ *cur_idx;
+			continue;
+		}
+
+		p = get_pid_task(pid, PIDTYPE_PID);
+
+		if (p && !task_paired(p) && p->virt_cookie
+		      && p->virt_cookie == kvm_cookie) {
+			vcpu_task = p;
+			break;
+		} else {
+			put_task_struct(p);
+		}
+
+		++ *cur_idx;
+	}
+	rcu_read_unlock();
+
+	if (vcpu_task)
+		WARN_ON(vcpu_task->virt_cookie != kvm_cookie);
+
+	return vcpu_task;
+}
+EXPORT_SYMBOL_GPL(vcpu_next_unpaired);
 
 /*
  * Helper that checks whether a VCPU is eligible for directed yield.
