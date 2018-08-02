@@ -9816,6 +9816,10 @@ abort:
 			attach_one_task(env->dst_rq, vcpu_task);
 			task_set_paired(vcpu_task);
 			task_set_paired(current);
+			vcpu_printk("load_balance: current %lx on %d, move vcpu_task %lx (cookie %lx) from cpu %d to %d\n",
+				(unsigned long) current, this_cpu, (unsigned long) vcpu_task,
+				vcpu_task->virt_cookie, env->src_cpu,
+				env->dst_cpu);
 			put_task_struct(vcpu_task);
 		}
 
