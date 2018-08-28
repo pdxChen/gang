@@ -5616,7 +5616,7 @@ vcpu_pick_next_task(struct rq *rq, struct task_struct *prev)
 	if (!cookie)
 		goto unlock;
 
-	p = vcpu_find(rq, sds->rendezvous_cookie);
+	p = vcpu_find(rq, cookie);
 	if (p)
 		put_prev_task(rq, prev);
 
