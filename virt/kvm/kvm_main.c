@@ -2303,9 +2303,6 @@ struct task_struct *vcpu_next_unpaired(int *cur_idx, unsigned long kvm_cookie)
 	}
 	rcu_read_unlock();
 
-	if (vcpu_task)
-		WARN_ON(vcpu_task->virt_cookie != kvm_cookie);
-
 	return vcpu_task;
 }
 EXPORT_SYMBOL_GPL(vcpu_next_unpaired);
