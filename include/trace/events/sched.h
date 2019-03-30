@@ -135,6 +135,61 @@ static inline long __trace_sched_switch_state(bool preempt, struct task_struct *
 /*
  * Tracepoint for task switches, performed by the scheduler:
  */
+#ifdef CONFIG_SCHED_CORE
+TRACE_EVENT(sched_switch,
+
+	TP_PROTO(bool preempt,
+		 struct task_struct *prev,
+		 struct task_struct *next),
+
+	TP_ARGS(preempt, prev, next),
+
+	TP_STRUCT__entry(
+		__array(	char,	prev_comm,	TASK_COMM_LEN	)
+		__field(	pid_t,	prev_pid			)
+		__field(	int,	prev_prio			)
+		__field(	long,	prev_state			)
+		__field(	unsigned long,	prev_cookie		)
+		__array(	char,	next_comm,	TASK_COMM_LEN	)
+		__field(	pid_t,	next_pid			)
+		__field(	int,	next_prio			)
+		__field(	unsigned long,	next_cookie		)
+	),
+
+	TP_fast_assign(
+		memcpy(__entry->next_comm, next->comm, TASK_COMM_LEN);
+		__entry->prev_pid	= prev->pid;
+		__entry->prev_prio	= prev->prio;
+		__entry->prev_state	= __trace_sched_switch_state(preempt, prev);
+		__entry->prev_cookie	= prev->core_cookie;
+		memcpy(__entry->prev_comm, prev->comm, TASK_COMM_LEN);
+		__entry->next_pid	= next->pid;
+		__entry->next_prio	= next->prio;
+		__entry->next_cookie	= next->core_cookie;
+		/* XXX SCHED_DEADLINE */
+	),
+
+	TP_printk("prev_comm=%s prev_pid=%d prev_prio=%d prev_state=%s%s prev_cookie=%lx ==> next_comm=%s next_pid=%d next_prio=%d next_cookie=%lx",
+		__entry->prev_comm, __entry->prev_pid, __entry->prev_prio,
+
+		(__entry->prev_state & (TASK_REPORT_MAX - 1)) ?
+		  __print_flags(__entry->prev_state & (TASK_REPORT_MAX - 1), "|",
+				{ TASK_INTERRUPTIBLE, "S" },
+				{ TASK_UNINTERRUPTIBLE, "D" },
+				{ __TASK_STOPPED, "T" },
+				{ __TASK_TRACED, "t" },
+				{ EXIT_DEAD, "X" },
+				{ EXIT_ZOMBIE, "Z" },
+				{ TASK_PARKED, "P" },
+				{ TASK_DEAD, "I" }) :
+		  "R",
+
+		__entry->prev_state & TASK_REPORT_MAX ? "+" : "",
+		__entry->prev_cookie,
+		__entry->next_comm, __entry->next_pid, __entry->next_prio,
+		__entry->next_cookie)
+);
+#else /* CONFIG_SCHED_CORE */
 TRACE_EVENT(sched_switch,
 
 	TP_PROTO(bool preempt,
@@ -182,6 +237,7 @@ TRACE_EVENT(sched_switch,
 		__entry->prev_state & TASK_REPORT_MAX ? "+" : "",
 		__entry->next_comm, __entry->next_pid, __entry->next_prio)
 );
+#endif
 
 /*
  * Tracepoint for a task being migrated:
