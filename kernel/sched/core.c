@@ -192,6 +192,8 @@ static struct task_struct *sched_core_find(struct rq *rq, unsigned long cookie)
 	 * The idle task always matches any cookie!
 	 */
 	match = idle_sched_class.pick_task(rq);
+	if (!cookie)
+		goto out;
 
 	while (node) {
 		node_task = container_of(node, struct task_struct, core_node);
@@ -205,7 +207,7 @@ static struct task_struct *sched_core_find(struct rq *rq, unsigned long cookie)
 			node = node->rb_left;
 		}
 	}
-
+out:
 	return match;
 }
 
@@ -3663,18 +3665,6 @@ pick_task(struct rq *rq, const struct sched_class *class, struct task_struct *ma
 	if (!class_pick)
 		return NULL;
 
-	if (!cookie) {
-		/*
-		 * If class_pick is tagged, return it only if it has
-		 * higher priority than max.
-		 */
-		if (max && class_pick->core_cookie &&
-		    prio_less(class_pick, max))
-			return idle_sched_class.pick_task(rq);
-
-		return class_pick;
-	}
-
 	/*
 	 * If class_pick is idle or matches cookie, return early.
 	 */
@@ -3688,8 +3678,7 @@ pick_task(struct rq *rq, const struct sched_class *class, struct task_struct *ma
 	 * the core (so far) and it must be selected, otherwise we must go with
 	 * the cookie pick in order to satisfy the constraint.
 	 */
-	if (prio_less(cookie_pick, class_pick) &&
-	    (!max || prio_less(max, class_pick)))
+	if (!max || prio_less(max, class_pick))
 		return class_pick;
 
 	return cookie_pick;
