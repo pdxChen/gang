@@ -3762,7 +3762,6 @@ pick_next_task(struct rq *rq, struct task_struct *prev, struct rq_flags *rf)
 	 * order.
 	 */
 	for_each_class(class) {
-again:
 		for_each_cpu_wrap(i, smt_mask, cpu) {
 			struct rq *rq_i = cpu_rq(i);
 			struct task_struct *p;
@@ -3834,10 +3833,10 @@ again:
 						if (j == i)
 							continue;
 
-						cpu_rq(j)->core_pick = NULL;
+						cpu_rq(j)->core_pick = idle_sched_class.pick_task(cpu_rq(j));
 					}
 					occ = 1;
-					goto again;
+					goto out;
 				} else {
 					/*
 					 * Once we select a task for a cpu, we
@@ -3852,7 +3851,7 @@ again:
 		}
 next_class:;
 	}
-
+out:
 	rq->core->core_pick_seq = rq->core->core_task_seq;
 	next = rq->core_pick;
 	rq->core_sched_seq = rq->core->core_pick_seq;
