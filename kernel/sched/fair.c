@@ -7508,6 +7508,9 @@ static inline int migrate_degrades_locality(struct task_struct *p,
 }
 #endif
 
+static inline s64 core_sched_imbalance_improvement(int src_cpu, int dst_cpu,
+					      struct task_struct *p);
+
 /*
  * can_migrate_task - may task p from runqueue rq be migrated to this_cpu?
  */
@@ -7971,6 +7974,11 @@ struct sg_lb_stats {
 	unsigned int nr_numa_running;
 	unsigned int nr_preferred_running;
 #endif
+#ifdef CONFIG_SCHED_CORE
+	int			imbl_cpu;
+	struct task_group	*imbl_tg;
+	s64			imbl_load;
+#endif
 };
 
 /*
@@ -8315,6 +8323,145 @@ static bool update_nohz_stats(struct rq *rq, bool force)
 #endif
 }
 
+#ifdef CONFIG_SCHED_CORE
+static inline int cpu_sibling(int cpu)
+{
+	int i;
+
+	for_each_cpu(i, cpu_smt_mask(cpu)) {
+		if (i == cpu)
+			continue;
+		return i;
+	}
+	return -1;
+}
+
+static inline s64 core_sched_imbalance_delta(int src_cpu, int dst_cpu,
+			int src_sibling, int dst_sibling,
+			struct task_group *tg, u64 task_load)
+{
+	struct sched_entity *se, *se_sibling, *dst_se, *dst_se_sibling;
+	s64 excess, deficit, old_mismatch, new_mismatch;
+
+	if (src_cpu == dst_cpu)
+		return -1;
+
+	/* XXX SMT4 will require additional logic */
+
+	se = tg->se[src_cpu];
+	se_sibling = tg->se[src_sibling];
+
+	excess = se->avg.load_avg - se_sibling->avg.load_avg;
+	if (src_sibling == dst_cpu) {
+		old_mismatch = abs(excess);
+		new_mismatch = abs(excess - 2*task_load);
+		return old_mismatch - new_mismatch;
+	}
+
+	dst_se = tg->se[dst_cpu];
+	dst_se_sibling = tg->se[dst_sibling];
+	deficit = dst_se->avg.load_avg - dst_se_sibling->avg.load_avg;
+
+	old_mismatch = abs(excess) + abs(deficit);
+	new_mismatch = abs(excess - (s64) task_load) +
+		       abs(deficit + (s64) task_load);
+
+	if (excess > 0 && deficit < 0)
+		return old_mismatch - new_mismatch;
+	else
+		/* no mismatch improvement */
+		return -1;
+}
+
+static inline s64 core_sched_imbalance_improvement(int src_cpu, int dst_cpu,
+					      struct task_struct *p)
+{
+	int src_sibling, dst_sibling;
+	unsigned long task_load = task_h_load(p);
+	struct task_group *tg;
+
+	if (!p->se.parent)
+		return 0;
+
+	tg = p->se.parent->cfs_rq->tg;
+	if (!tg->tagged)
+		return 0;
+
+	/* XXX SMT4 will require additional logic */
+	src_sibling = cpu_sibling(src_cpu);
+	dst_sibling = cpu_sibling(dst_cpu);
+
+	if (src_sibling == -1 || dst_sibling == -1)
+		return 0;
+
+	return core_sched_imbalance_delta(src_cpu, dst_cpu,
+					  src_sibling, dst_sibling,
+					  tg, task_load);
+}
+
+static inline void core_sched_imbalance_scan(struct sg_lb_stats *sgs,
+					     int src_cpu,
+					     int dst_cpu)
+{
+	struct rq *rq;
+	struct cfs_rq *cfs_rq, *pos;
+	struct task_group *tg;
+	s64 mismatch;
+	int src_sibling, dst_sibling;
+	u64 src_avg_load_task;
+
+	if (!sched_core_enabled(cpu_rq(src_cpu)) ||
+	    !sched_core_enabled(cpu_rq(dst_cpu)) ||
+	    src_cpu == dst_cpu)
+		return;
+
+	rq = cpu_rq(src_cpu);
+
+	src_sibling = cpu_sibling(src_cpu);
+	dst_sibling = cpu_sibling(dst_cpu);
+
+	if (src_sibling == -1 || dst_sibling == -1)
+		return;
+
+	src_avg_load_task = cpu_avg_load_per_task(src_cpu);
+
+	if (src_avg_load_task == 0)
+		return;
+
+	/*
+	 * Imbalance in tagged task group's load causes forced
+	 * idle time in sibling, that will be counted as mismatched load
+	 * on the forced idled cpu.  Record the source cpu in the sched
+	 * group causing the largest mismatched load.
+	 */
+	for_each_leaf_cfs_rq_safe(rq, cfs_rq, pos) {
+
+		tg = cfs_rq->tg;
+		if (!tg->tagged)
+			continue;
+
+		mismatch = core_sched_imbalance_delta(src_cpu, dst_cpu,
+						      src_sibling, dst_sibling,
+						      tg, src_avg_load_task);
+
+		if (mismatch > sgs->imbl_load &&
+		    mismatch > src_avg_load_task) {
+			sgs->imbl_load = mismatch;
+			sgs->imbl_tg = tg;
+			sgs->imbl_cpu = src_cpu;
+		}
+	}
+}
+
+#else
+#define core_sched_imbalance_scan(sgs, src_cpu, dst_cpu)
+static inline s64 core_sched_imbalance_improvement(int src_cpu, int dst_cpu,
+					      struct task_struct *p)
+{
+	return 0;
+}
+#endif /* CONFIG_SCHED_CORE */
+
 /**
  * update_sg_lb_stats - Update sched_group's statistics for load balancing.
  * @env: The load balancing environment.
@@ -8346,7 +8493,8 @@ static inline void update_sg_lb_stats(struct lb_env *env,
 		else
 			load = source_load(i, load_idx);
 
-		sgs->group_load += load;
+		core_sched_imbalance_scan(sgs, i, env->dst_cpu);
+
 		sgs->group_util += cpu_util(i);
 		sgs->sum_nr_running += rq->cfs.h_nr_running;
 
