@@ -7413,6 +7413,11 @@ struct lb_env {
 	enum fbq_type		fbq_type;
 	enum group_type		src_grp_type;
 	struct list_head	tasks;
+#ifdef CONFIG_SCHED_CORE
+	int			imbl_cpu;
+	struct task_group	*imbl_tg;
+	s64			imbl_load;
+#endif
 };
 
 /*
@@ -7560,6 +7565,12 @@ int can_migrate_task(struct task_struct *p, struct lb_env *env)
 
 		return 0;
 	}
+
+#ifdef CONFIG_SCHED_CORE
+	/* Don't migrate if we increase core imbalance */
+	if (core_sched_imbalance_improvement(env->src_cpu, env->dst_cpu, p) < 0)
+		return 0;
+#endif
 
 	/* Record that we found atleast one task that could run on dst_cpu */
 	env->flags &= ~LBF_ALL_PINNED;
@@ -8534,6 +8545,14 @@ static inline void update_sg_lb_stats(struct lb_env *env,
 
 	sgs->group_no_capacity = group_is_overloaded(env, sgs);
 	sgs->group_type = group_classify(group, sgs);
+
+#ifdef CONFIG_SCHED_CORE
+	if (sgs->imbl_load > env->imbl_load) {
+		env->imbl_cpu = sgs->imbl_cpu;
+		env->imbl_tg = sgs->imbl_tg;
+		env->imbl_load = sgs->imbl_load;
+	}
+#endif
 }
 
 /**
@@ -9066,6 +9085,15 @@ static struct rq *find_busiest_queue(struct lb_env *env,
 	struct rq *busiest = NULL, *rq;
 	unsigned long busiest_load = 0, busiest_capacity = 1;
 	int i;
+
+#ifdef CONFIG_SCHED_CORE
+	if (env->imbl_load > env->imbalance) {
+		env->imbalance = cpu_avg_load_per_task(env->imbl_cpu);
+		return cpu_rq(env->imbl_cpu);
+	} else {
+		env->imbl_load = 0;
+	}
+#endif
 
 	for_each_cpu_and(i, sched_group_span(group), env->cpus) {
 		unsigned long capacity, wl;
